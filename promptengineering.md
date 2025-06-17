@@ -173,3 +173,6 @@ When using AI for business processes and automation getting the prompts right ca
 
 Anthropic have a great article on prompt engineering, it is a short read but will change how you interact with AI.
 [Prompt engineering overview](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview)
+
+There is also a good article on AWS
+[What is prompt engineering?](https://aws.amazon.com/what-is/prompt-engineering/)
