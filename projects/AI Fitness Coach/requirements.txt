@@ -1,0 +1,6 @@
+anthropic
+flask
+pandas
+datetime
+requests
+schedule
