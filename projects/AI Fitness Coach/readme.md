@@ -86,7 +86,7 @@ Focus points:
 3. Maintain strength training to preserve skeletal muscle mass during weight loss
 4. Consider consultation with healthcare provider regarding rapid weight fluctuation and visceral fat increase
 
-**A new workout plan will be output to ./files/workout.txt**
+**A new workout plan will be output to ./files/workout.txt.**
 Based on the client's data showing high body fat (31.9% dropping to 30.1%) and high visceral fat (13-15%), while having good skeletal muscle mass (44%), I'll recommend a program focusing on fat loss while maintaining muscle mass.
 
 <answer>
