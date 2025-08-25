@@ -1,0 +1,452 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$JsonFilePath,
+    
+    [bool]$WhatIf = $false,
+    [bool]$CreateMailboxes = $true,
+    [bool]$CreateSecurityGroups = $true,
+    [bool]$MigrateUsers = $true
+)
+
+# Initialize logging arrays
+$SuccessLog = @()
+$FailureLog = @()
+
+function Write-ProcessLog {
+    param(
+        [string]$Message,
+        [string]$Type = "Info",
+        [bool]$Success = $true
+    )
+    
+    $LogEntry = @{
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Type = $Type
+        Message = $Message
+        WhatIf = $WhatIf
+    }
+    
+    if ($Success) {
+        $script:SuccessLog += $LogEntry
+    } else {
+        $script:FailureLog += $LogEntry
+    }
+    
+    Write-Host "[$Type] $Message" -ForegroundColor $(if($Success){"Green"}else{"Red"})
+}
+
+function Get-UniqueAliasesFromProxyAddresses {
+    param(
+        [array]$ProxyAddresses
+    )
+    
+    $Aliases = @()
+    
+    foreach ($Address in $ProxyAddresses) {
+        if ($Address -match "^smtp?:(.+)@(.+)$") {
+            $Prefix = $Matches[1]
+            # Remove any invalid characters for EXO aliases
+            $CleanPrefix = $Prefix -replace '[^a-zA-Z0-9]', ''
+            if ($CleanPrefix -and $Aliases -notcontains $CleanPrefix) {
+                $Aliases += $CleanPrefix
+            }
+        }
+    }
+    
+    return $Aliases
+}
+
+function Resolve-DelegateObject {
+    param(
+        [string]$CN
+    )
+    
+    try {
+        # Try to resolve as user first
+        $User = Get-User -Identity $CN -ErrorAction Stop
+        return @{
+            Type = "User"
+            Identity = $User.UserPrincipalName
+            DisplayName = $User.DisplayName
+            Success = $true
+        }
+    }
+    catch {
+        try {
+            # Try to resolve as distribution group
+            $Group = Get-DistributionGroup -Identity $CN -ErrorAction Stop
+            return @{
+                Type = "DistributionGroup"
+                Identity = $Group.PrimarySmtpAddress
+                DisplayName = $Group.DisplayName
+                Success = $true
+            }
+        }
+        catch {
+            return @{
+                Type = "Unknown"
+                Identity = $CN
+                DisplayName = $CN
+                Success = $false
+                Error = $_.Exception.Message
+            }
+        }
+    }
+}
+
+function Test-MailboxExists {
+    param(
+        [string]$MailboxName
+    )
+    
+    try {
+        $Mailbox = Get-Mailbox -Identity $MailboxName -ErrorAction Stop
+        return @{
+            Exists = $true
+            Mailbox = $Mailbox
+        }
+    }
+    catch {
+        return @{
+            Exists = $false
+            Mailbox = $null
+        }
+    }
+}
+
+function Test-SecurityGroupExists {
+    param(
+        [string]$GroupName
+    )
+    
+    try {
+        $Group = Get-DistributionGroup -Identity $GroupName -ErrorAction Stop
+        return @{
+            Exists = $true
+            Group = $Group
+        }
+    }
+    catch {
+        return @{
+            Exists = $false
+            Group = $null
+        }
+    }
+}
+
+function New-MailboxWithGroup {
+    param(
+        [object]$MailboxData
+    )
+    
+    $MailboxName = $MailboxData.cn
+    $DisplayName = $MailboxData.displayName
+    $PrimarySmtp = $MailboxData.extensionAttribute7
+    
+    # Get aliases from proxy addresses
+    $Aliases = Get-UniqueAliasesFromProxyAddresses -ProxyAddresses $MailboxData.proxyAddresses
+    
+    # Create Security Group first
+    if ($CreateSecurityGroups) {
+        $GroupName = "$MailboxName-Delegates"
+        
+        $GroupExists = Test-SecurityGroupExists -GroupName $GroupName
+        
+        if (-not $GroupExists.Exists) {
+            if ($WhatIf) {
+                Write-ProcessLog -Message "WHATIF: Would create mail-enabled security group: $GroupName" -Type "WhatIf"
+            } else {
+                try {
+                    $NewGroup = New-DistributionGroup -Name $GroupName -Type Security -PrimarySmtpAddress "$GroupName@$((Get-AcceptedDomain | Where-Object {$_.Default}).Name)" -DisplayName "$DisplayName Delegates"
+                    Set-DistributionGroup -Identity $GroupName -CustomAttribute15 $MailboxName
+                    Write-ProcessLog -Message "Created security group: $GroupName" -Type "Success"
+                } catch {
+                    Write-ProcessLog -Message "Failed to create security group $GroupName`: $($_.Exception.Message)" -Type "Error" -Success $false
+                    return $false
+                }
+            }
+        } else {
+            Write-ProcessLog -Message "Security group already exists: $GroupName" -Type "Info"
+        }
+        
+        # Add delegates to group
+        if ($MailboxData.publicDelegates) {
+            foreach ($DelegateCN in $MailboxData.publicDelegates) {
+                $ResolvedDelegate = Resolve-DelegateObject -CN $DelegateCN
+                
+                if ($ResolvedDelegate.Success) {
+                    if ($WhatIf) {
+                        Write-ProcessLog -Message "WHATIF: Would add $($ResolvedDelegate.Type) '$($ResolvedDelegate.DisplayName)' to group $GroupName" -Type "WhatIf"
+                    } else {
+                        try {
+                            Add-DistributionGroupMember -Identity $GroupName -Member $ResolvedDelegate.Identity
+                            Write-ProcessLog -Message "Added $($ResolvedDelegate.Type) '$($ResolvedDelegate.DisplayName)' to group $GroupName" -Type "Success"
+                        } catch {
+                            Write-ProcessLog -Message "Failed to add delegate '$($ResolvedDelegate.Identity)' to group $GroupName`: $($_.Exception.Message)" -Type "Error" -Success $false
+                        }
+                    }
+                } else {
+                    Write-ProcessLog -Message "Failed to resolve delegate: $DelegateCN - $($ResolvedDelegate.Error)" -Type "Warning" -Success $false
+                }
+            }
+        }
+    }
+    
+    # Create Shared Mailbox
+    if ($CreateMailboxes) {
+        $MailboxExists = Test-MailboxExists -MailboxName $MailboxName
+        
+        if (-not $MailboxExists.Exists) {
+            if ($WhatIf) {
+                Write-ProcessLog -Message "WHATIF: Would create shared mailbox: $MailboxName" -Type "WhatIf"
+                Write-ProcessLog -Message "WHATIF: Would add aliases: $($Aliases -join ', ')" -Type "WhatIf"
+            } else {
+                try {
+                    $NewMailbox = New-Mailbox -Shared -Name $MailboxName -DisplayName $DisplayName -PrimarySmtpAddress $PrimarySmtp
+                    Set-Mailbox -Identity $MailboxName -CustomAttribute15 "$MailboxName-Delegates"
+                    
+                    # Add aliases
+                    foreach ($Alias in $Aliases) {
+                        if ($Alias -ne $MailboxName) {
+                            Set-Mailbox -Identity $MailboxName -EmailAddresses @{Add="$Alias@$((Get-AcceptedDomain | Where-Object {$_.Default}).Name)"}
+                        }
+                    }
+                    
+                    Write-ProcessLog -Message "Created shared mailbox: $MailboxName with aliases: $($Aliases -join ', ')" -Type "Success"
+                } catch {
+                    Write-ProcessLog -Message "Failed to create shared mailbox $MailboxName`: $($_.Exception.Message)" -Type "Error" -Success $false
+                    return $false
+                }
+            }
+        } else {
+            Write-ProcessLog -Message "Shared mailbox already exists: $MailboxName" -Type "Info"
+        }
+        
+        # Add security group to mailbox permissions
+        if ($CreateSecurityGroups) {
+            $GroupName = "$MailboxName-Delegates"
+            
+            if ($WhatIf) {
+                Write-ProcessLog -Message "WHATIF: Would add group $GroupName to mailbox $MailboxName permissions" -Type "WhatIf"
+            } else {
+                try {
+                    Add-MailboxPermission -Identity $MailboxName -User $GroupName -AccessRights FullAccess -InheritanceType All
+                    Add-RecipientPermission -Identity $MailboxName -Trustee $GroupName -AccessRights SendAs -Confirm:$false
+                    Write-ProcessLog -Message "Added group $GroupName to mailbox $MailboxName permissions" -Type "Success"
+                } catch {
+                    Write-ProcessLog -Message "Failed to add group permissions to mailbox $MailboxName`: $($_.Exception.Message)" -Type "Error" -Success $false
+                }
+            }
+        }
+        
+        # Add owners to mailbox permissions
+        if ($MailboxData.owners) {
+            foreach ($Owner in $MailboxData.owners) {
+                $OwnerUPN = $Owner.kerberos
+                
+                if ($WhatIf) {
+                    Write-ProcessLog -Message "WHATIF: Would add owner '$($Owner.name)' to mailbox $MailboxName" -Type "WhatIf"
+                } else {
+                    try {
+                        Add-MailboxPermission -Identity $MailboxName -User $OwnerUPN -AccessRights FullAccess -InheritanceType All
+                        Add-RecipientPermission -Identity $MailboxName -Trustee $OwnerUPN -AccessRights SendAs -Confirm:$false
+                        Write-ProcessLog -Message "Added owner '$($Owner.name)' to mailbox $MailboxName" -Type "Success"
+                    } catch {
+                        Write-ProcessLog -Message "Failed to add owner '$($Owner.name)' to mailbox $MailboxName`: $($_.Exception.Message)" -Type "Error" -Success $false
+                    }
+                }
+            }
+        }
+    }
+    
+    return $true
+}
+
+function Move-UsersToGroup {
+    param(
+        [object]$MailboxData,
+        [object]$ExistingMailbox
+    )
+    
+    $MailboxName = $MailboxData.cn
+    $GroupName = "$MailboxName-Delegates"
+    
+    # Get existing mailbox permissions
+    try {
+        $MailboxPermissions = Get-MailboxPermission -Identity $MailboxName | Where-Object { $_.IsInherited -eq $false -and $_.User -ne "NT AUTHORITY\SELF" }
+        $RecipientPermissions = Get-RecipientPermission -Identity $MailboxName | Where-Object { $_.IsInherited -eq $false -and $_.Trustee -ne "NT AUTHORITY\SELF" }
+    } catch {
+        Write-ProcessLog -Message "Failed to get existing permissions for mailbox $MailboxName`: $($_.Exception.Message)" -Type "Error" -Success $false
+        return $false
+    }
+    
+    # Create security group if it doesn't exist
+    $GroupExists = Test-SecurityGroupExists -GroupName $GroupName
+    
+    if (-not $GroupExists.Exists -and $CreateSecurityGroups) {
+        if ($WhatIf) {
+            Write-ProcessLog -Message "WHATIF: Would create security group for existing mailbox: $GroupName" -Type "WhatIf"
+        } else {
+            try {
+                $NewGroup = New-DistributionGroup -Name $GroupName -Type Security -PrimarySmtpAddress "$GroupName@$((Get-AcceptedDomain | Where-Object {$_.Default}).Name)" -DisplayName "$($MailboxData.displayName) Delegates"
+                Set-DistributionGroup -Identity $GroupName -CustomAttribute15 $MailboxName
+                Write-ProcessLog -Message "Created security group for existing mailbox: $GroupName" -Type "Success"
+            } catch {
+                Write-ProcessLog -Message "Failed to create security group $GroupName for existing mailbox: $($_.Exception.Message)" -Type "Error" -Success $false
+                return $false
+            }
+        }
+    }
+    
+    # Move existing users to group
+    $UsersToMigrate = @()
+    
+    foreach ($Permission in $MailboxPermissions) {
+        if ($Permission.User -notin $UsersToMigrate) {
+            $UsersToMigrate += $Permission.User
+        }
+    }
+    
+    foreach ($Permission in $RecipientPermissions) {
+        if ($Permission.Trustee -notin $UsersToMigrate) {
+            $UsersToMigrate += $Permission.Trustee
+        }
+    }
+    
+    foreach ($User in $UsersToMigrate) {
+        if ($WhatIf) {
+            Write-ProcessLog -Message "WHATIF: Would add existing user '$User' to group $GroupName and remove direct permissions" -Type "WhatIf"
+        } else {
+            try {
+                # Add to group
+                Add-DistributionGroupMember -Identity $GroupName -Member $User
+                
+                # Remove direct permissions
+                Remove-MailboxPermission -Identity $MailboxName -User $User -AccessRights FullAccess -Confirm:$false
+                Remove-RecipientPermission -Identity $MailboxName -Trustee $User -AccessRights SendAs -Confirm:$false
+                
+                Write-ProcessLog -Message "Migrated user '$User' to group $GroupName" -Type "Success"
+            } catch {
+                Write-ProcessLog -Message "Failed to migrate user '$User': $($_.Exception.Message)" -Type "Error" -Success $false
+            }
+        }
+    }
+    
+    # Add group to mailbox permissions
+    if ($CreateSecurityGroups) {
+        if ($WhatIf) {
+            Write-ProcessLog -Message "WHATIF: Would add group $GroupName to existing mailbox $MailboxName permissions" -Type "WhatIf"
+        } else {
+            try {
+                Add-MailboxPermission -Identity $MailboxName -User $GroupName -AccessRights FullAccess -InheritanceType All
+                Add-RecipientPermission -Identity $MailboxName -Trustee $GroupName -AccessRights SendAs -Confirm:$false
+                Write-ProcessLog -Message "Added group $GroupName to existing mailbox $MailboxName permissions" -Type "Success"
+            } catch {
+                Write-ProcessLog -Message "Failed to add group permissions to existing mailbox $MailboxName`: $($_.Exception.Message)" -Type "Error" -Success $false
+            }
+        }
+    }
+    
+    return $true
+}
+
+function Process-MailboxObject {
+    param(
+        [object]$MailboxData
+    )
+    
+    $MailboxName = $MailboxData.cn
+    Write-ProcessLog -Message "Processing mailbox: $MailboxName" -Type "Info"
+    
+    # Check if mailbox exists
+    $MailboxExists = Test-MailboxExists -MailboxName $MailboxName
+    
+    if (-not $MailboxExists.Exists) {
+        # Create new mailbox and group
+        Write-ProcessLog -Message "Mailbox does not exist - creating new mailbox and group" -Type "Info"
+        New-MailboxWithGroup -MailboxData $MailboxData
+    } else {
+        Write-ProcessLog -Message "Mailbox exists - checking for migration needs" -Type "Info"
+        
+        # Check if it already has the security group assigned
+        $GroupName = "$MailboxName-Delegates"
+        $GroupExists = Test-SecurityGroupExists -GroupName $GroupName
+        
+        if ($GroupExists.Exists) {
+            Write-ProcessLog -Message "Security group already exists for mailbox: $GroupName" -Type "Info"
+        } else {
+            # Check if it has direct user assignments that need migration
+            try {
+                $MailboxPermissions = Get-MailboxPermission -Identity $MailboxName | Where-Object { $_.IsInherited -eq $false -and $_.User -ne "NT AUTHORITY\SELF" }
+                $RecipientPermissions = Get-RecipientPermission -Identity $MailboxName | Where-Object { $_.IsInherited -eq $false -and $_.Trustee -ne "NT AUTHORITY\SELF" }
+                
+                if ($MailboxPermissions -or $RecipientPermissions) {
+                    Write-ProcessLog -Message "Found existing user permissions - migrating to group model" -Type "Info"
+                    if ($MigrateUsers) {
+                        Move-UsersToGroup -MailboxData $MailboxData -ExistingMailbox $MailboxExists.Mailbox
+                    } else {
+                        Write-ProcessLog -Message "User migration disabled - skipping" -Type "Info"
+                    }
+                } else {
+                    Write-ProcessLog -Message "No existing permissions found on mailbox" -Type "Info"
+                }
+            } catch {
+                Write-ProcessLog -Message "Failed to check existing permissions for $MailboxName`: $($_.Exception.Message)" -Type "Error" -Success $false
+            }
+        }
+    }
+}
+
+# Main execution
+try {
+    Write-ProcessLog -Message "Starting shared mailbox migration process" -Type "Info"
+    Write-ProcessLog -Message "Parameters: WhatIf=$WhatIf, CreateMailboxes=$CreateMailboxes, CreateSecurityGroups=$CreateSecurityGroups, MigrateUsers=$MigrateUsers" -Type "Info"
+    
+    # Read JSON file
+    if (-not (Test-Path $JsonFilePath)) {
+        Write-ProcessLog -Message "JSON file not found: $JsonFilePath" -Type "Error" -Success $false
+        exit 1
+    }
+    
+    $JsonContent = Get-Content $JsonFilePath -Raw | ConvertFrom-Json
+    Write-ProcessLog -Message "Loaded $($JsonContent.Count) mailbox definitions from JSON" -Type "Info"
+    
+    # Process each mailbox object
+    foreach ($MailboxData in $JsonContent) {
+        Process-MailboxObject -MailboxData $MailboxData
+    }
+    
+    Write-ProcessLog -Message "Migration process completed" -Type "Info"
+    Write-ProcessLog -Message "Successful operations: $($SuccessLog.Count)" -Type "Info"
+    Write-ProcessLog -Message "Failed operations: $($FailureLog.Count)" -Type "Info"
+    
+} catch {
+    Write-ProcessLog -Message "Critical error in main execution: $($_.Exception.Message)" -Type "Error" -Success $false
+} finally {
+    # Output logs as artifacts
+    $LogOutput = @{
+        Summary = @{
+            TotalSuccessful = $SuccessLog.Count
+            TotalFailed = $FailureLog.Count
+            ExecutionTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Parameters = @{
+                WhatIf = $WhatIf
+                CreateMailboxes = $CreateMailboxes
+                CreateSecurityGroups = $CreateSecurityGroups
+                MigrateUsers = $MigrateUsers
+            }
+        }
+        SuccessLog = $SuccessLog
+        FailureLog = $FailureLog
+    }
+    
+    $LogJson = $LogOutput | ConvertTo-Json -Depth 10
+    
+    # Output for ADO artifact collection
+    Write-Host "##vso[artifact.upload containerfolder=logs;artifactname=migration-logs]$LogJson"
+    
+    # Also write to file for local testing
+    $LogJson | Out-File -FilePath "migration-log-$(Get-Date -Format 'yyyyMMdd-HHmmss').json" -Encoding UTF8
+    
+    Write-Host "Migration process completed. Check logs for details."
+}
